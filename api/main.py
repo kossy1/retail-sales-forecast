@@ -1,11 +1,16 @@
 """FastAPI application for retail sales forecasting with POS upload."""
+import sys
+import os
 
+
+# Now your normal imports work
+from config.settings import config
+from config.logging_config import logger
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta
 from io import BytesIO
 from pathlib import Path
-import os
 import joblib
 import numpy as np
 import pandas as pd
@@ -17,6 +22,10 @@ from api.data_quality import analyze_quality
 from api import retrain as retrain_module
 
 
+# Add the project root to sys.path so 'config' and 'src' are importable
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 # ============================================================
 # APP INITIALIZATION
 # ============================================================
