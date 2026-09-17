@@ -1,0 +1,4 @@
+-r requirements.txt  # Include production deps
+ipykernel==6.25.0
+jupyter==1.0.0
+pre-commit==3.3.3

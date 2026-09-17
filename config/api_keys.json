@@ -1,0 +1,19 @@
+{
+  "keys": {
+    "admin-key-change-me": {
+      "user": "admin",
+      "role": "admin",
+      "created": "2026-01-01T00:00:00"
+    },
+    "analyst-key-change-me": {
+      "user": "analyst",
+      "role": "analyst",
+      "created": "2026-01-01T00:00:00"
+    },
+    "viewer-key-change-me": {
+      "user": "viewer",
+      "role": "viewer",
+      "created": "2026-01-01T00:00:00"
+    }
+  }
+}
