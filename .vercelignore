@@ -1,0 +1,5 @@
+# .vercelignore
+pyproject.toml
+uv.lock
+Pipfile
+Pipfile.lock

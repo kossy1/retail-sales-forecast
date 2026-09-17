@@ -1,23 +1,12 @@
-# Core
-numpy>=1.26.0,<2.0
-pandas>=2.1.0
-scipy>=1.11.0
-
-# ML (CPU-only)
-lightgbm-cpu>=4.1.0
-xgboost-cpu>=2.0.0
-scikit-learn>=1.3.0
-
-# API
 fastapi>=0.104.0
-uvicorn>=0.24.0
+uvicorn[standard]>=0.24.0
 pydantic>=2.4.0
 pydantic-settings>=2.0.0
-
-# Utilities
+pandas>=2.1.0
+numpy>=1.26.0,<2.0
+lightgbm>=4.1.0
+scikit-learn>=1.3.0
 python-dotenv>=1.0.0
 loguru>=0.7.2
 joblib>=1.3.0
-
-# Excel support
 openpyxl>=3.1.0
