@@ -1,16 +1,25 @@
 """FastAPI application for retail sales forecasting with POS upload."""
+
+# ============================================================
+# VERCEL PATH FIX — must come before any local imports
+# ============================================================
 import sys
 import os
 
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-# Now your normal imports work
-from config.settings import config
-from config.logging_config import logger
+# ============================================================
+# STANDARD IMPORTS
+# ============================================================
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from datetime import datetime, timedelta
 from io import BytesIO
 from pathlib import Path
+from typing import Optional
 import joblib
 import numpy as np
 import pandas as pd
@@ -22,10 +31,6 @@ from api.data_quality import analyze_quality
 from api import retrain as retrain_module
 
 
-# Add the project root to sys.path so 'config' and 'src' are importable
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
 # ============================================================
 # APP INITIALIZATION
 # ============================================================
@@ -45,11 +50,14 @@ app.add_middleware(
 
 
 # ============================================================
-# GLOBAL STATE
+# LAZY GLOBAL STATE
+# (Vercel serverless doesn't reliably fire startup events,
+#  so we load on first request instead)
 # ============================================================
-model_bundle = None
-model_loaded_time = None
-history_df = None
+_model_bundle = None
+_model_loaded_time = None
+_history_df = None
+_load_error = None
 
 UPLOAD_PATH = config.data.raw_data_path / "pos_uploads.parquet"
 EXPECTED_COLUMNS = [
@@ -58,28 +66,32 @@ EXPECTED_COLUMNS = [
 ]
 
 
-# ============================================================
-# STARTUP
-# ============================================================
-@app.on_event("startup")
-async def startup():
-    global model_bundle, model_loaded_time, history_df
-    logger.info("Starting API...")
+def _ensure_model_loaded():
+    """Load model + history on first call (Vercel-safe)."""
+    global _model_bundle, _model_loaded_time, _history_df, _load_error
 
-    latest = config.data.models_path / "latest.pkl"
-    if latest.exists():
-        model_bundle = joblib.load(latest)
-        model_loaded_time = datetime.now()
-        logger.info(f"Model loaded from {latest}")
-    else:
-        logger.warning("No model found. Train first: python -m src.models.train")
+    if _model_bundle is not None or _load_error is not None:
+        return
 
-    clean_path = config.data.processed_data_path / "sales_clean.parquet"
-    if clean_path.exists():
-        history_df = pd.read_parquet(clean_path)
-        logger.info(f"History loaded: {len(history_df):,} rows")
-    else:
-        logger.warning(f"No history at {clean_path}. Run training first.")
+    try:
+        latest = config.data.models_path / "latest.pkl"
+        if latest.exists():
+            _model_bundle = joblib.load(latest)
+            _model_loaded_time = datetime.now()
+            logger.info(f"Model loaded from {latest}")
+        else:
+            _load_error = f"Model not found at {latest}"
+            logger.warning(_load_error)
+
+        clean_path = config.data.processed_data_path / "sales_clean.parquet"
+        if clean_path.exists():
+            _history_df = pd.read_parquet(clean_path)
+            logger.info(f"History loaded: {len(_history_df):,} rows")
+        else:
+            logger.warning(f"No history at {clean_path}")
+    except Exception as e:
+        _load_error = str(e)
+        logger.error(f"Failed to load model/history: {e}")
 
 
 # ============================================================
@@ -105,23 +117,43 @@ async def root():
 
 @app.get("/health")
 async def health():
+    _ensure_model_loaded()
     return {
         "status": "healthy",
-        "model_loaded": model_bundle is not None,
-        "history_loaded": history_df is not None,
+        "model_loaded": _model_bundle is not None,
+        "history_loaded": _history_df is not None,
+        "load_error": _load_error,
         "environment": config.environment,
+    }
+
+
+@app.get("/debug/paths")
+async def debug_paths():
+    """Show resolved paths — useful for debugging Vercel deployment."""
+    return {
+        "project_root": str(config.data.raw_data_path.parent.parent),
+        "raw_data_path": str(config.data.raw_data_path),
+        "processed_data_path": str(config.data.processed_data_path),
+        "models_path": str(config.data.models_path),
+        "raw_data_exists": config.data.raw_data_path.exists(),
+        "processed_data_exists": config.data.processed_data_path.exists(),
+        "models_path_exists": config.data.models_path.exists(),
+        "latest_pkl_exists": (config.data.models_path / "latest.pkl").exists(),
+        "sales_clean_exists": (config.data.processed_data_path / "sales_clean.parquet").exists(),
+        "sys_path": sys.path[:5],
     }
 
 
 @app.get("/model/info")
 async def model_info(user: dict = Depends(get_current_user)):
-    if model_bundle is None:
-        raise HTTPException(503, "No model loaded")
+    _ensure_model_loaded()
+    if _model_bundle is None:
+        raise HTTPException(503, _load_error or "No model loaded")
     return {
         "model_type": "lightgbm",
-        "n_features": len(model_bundle["features"]),
-        "features": model_bundle["features"],
-        "loaded_at": model_loaded_time.isoformat() if model_loaded_time else None,
+        "n_features": len(_model_bundle["features"]),
+        "features": _model_bundle["features"],
+        "loaded_at": _model_loaded_time.isoformat() if _model_loaded_time else None,
     }
 
 
@@ -141,16 +173,18 @@ async def forecast(
     user: dict = Depends(get_current_user),
 ):
     """Generate a varied forecast for a store-SKU using recent history."""
-    if model_bundle is None:
-        raise HTTPException(503, "Model not loaded. Train first.")
-    if history_df is None:
+    _ensure_model_loaded()
+
+    if _model_bundle is None:
+        raise HTTPException(503, _load_error or "Model not loaded. Train first.")
+    if _history_df is None:
         raise HTTPException(503, "No historical data. Train first.")
 
-    model = model_bundle["model"]
-    features = model_bundle["features"]
+    model = _model_bundle["model"]
+    features = _model_bundle["features"]
 
-    sku_hist = history_df[
-        (history_df["store_id"] == store_id) & (history_df["sku_id"] == sku_id)
+    sku_hist = _history_df[
+        (_history_df["store_id"] == store_id) & (_history_df["sku_id"] == sku_id)
     ].sort_values("date")
 
     if sku_hist.empty:
@@ -290,22 +324,15 @@ def _build_feature_row(
 # POS DATA UPLOAD
 # ============================================================
 def _validate_upload(df: pd.DataFrame) -> pd.DataFrame:
-    """Validate and normalize uploaded POS data."""
     df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
 
     aliases = {
-        "qty": "sales_units",
-        "quantity": "sales_units",
-        "units_sold": "sales_units",
-        "sales": "sales_units",
-        "store": "store_id",
-        "shop_id": "store_id",
-        "sku": "sku_id",
-        "product_id": "sku_id",
-        "inventory": "inventory_level",
-        "on_hand": "inventory_level",
-        "promo": "promotion_flag",
-        "is_promo": "promotion_flag",
+        "qty": "sales_units", "quantity": "sales_units",
+        "units_sold": "sales_units", "sales": "sales_units",
+        "store": "store_id", "shop_id": "store_id",
+        "sku": "sku_id", "product_id": "sku_id",
+        "inventory": "inventory_level", "on_hand": "inventory_level",
+        "promo": "promotion_flag", "is_promo": "promotion_flag",
         "unit_price": "price",
     }
     df = df.rename(columns={k: v for k, v in aliases.items() if k in df.columns})
@@ -314,8 +341,7 @@ def _validate_upload(df: pd.DataFrame) -> pd.DataFrame:
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise HTTPException(
-            400,
-            f"Missing required columns: {missing}. Found: {list(df.columns)}",
+            400, f"Missing required columns: {missing}. Found: {list(df.columns)}"
         )
 
     if "price" not in df.columns:
@@ -349,9 +375,7 @@ def _validate_upload(df: pd.DataFrame) -> pd.DataFrame:
     if dropped:
         logger.warning(f"Dropped {dropped} invalid rows")
 
-    df = df[EXPECTED_COLUMNS]
-
-    return df
+    return df[EXPECTED_COLUMNS]
 
 
 def _append_to_store(df: pd.DataFrame) -> int:
@@ -384,7 +408,6 @@ async def upload_manual(
     inventory_level: int = Form(0),
     user: dict = Depends(require_role("admin", "analyst")),
 ):
-    """Upload a single POS record (requires admin or analyst role)."""
     try:
         row = {
             "date": pd.to_datetime(date),
@@ -403,8 +426,6 @@ async def upload_manual(
     n = _append_to_store(df)
     retrain_status = retrain_module.increment_upload(n)
 
-    logger.info(f"User '{user['user']}' uploaded 1 manual row")
-
     return {
         "status": "success",
         "rows_received": n,
@@ -420,7 +441,6 @@ async def upload_csv(
     file: UploadFile = File(...),
     user: dict = Depends(require_role("admin", "analyst")),
 ):
-    """Upload a CSV or XLSX file with POS data."""
     filename = file.filename.lower()
 
     if filename.endswith(".csv") or filename.endswith(".txt"):
@@ -445,8 +465,6 @@ async def upload_csv(
     if df.empty:
         raise HTTPException(400, "Uploaded file contains no rows")
 
-    logger.info(f"User '{user['user']}' uploaded {filename} ({len(df)} rows)")
-
     df = _validate_upload(df)
     if df.empty:
         raise HTTPException(400, "No valid rows after validation")
@@ -466,8 +484,6 @@ async def upload_csv(
             "min": df["date"].min().date().isoformat(),
             "max": df["date"].max().date().isoformat(),
         },
-        "stores": sorted(df["store_id"].unique().tolist())[:20],
-        "skus": sorted(df["sku_id"].unique().tolist())[:20],
         "uploaded_by": user["user"],
         "quality": quality,
         "retrain": retrain_status,
@@ -491,16 +507,11 @@ async def upload_summary(user: dict = Depends(get_current_user)):
         "n_stores": int(df["store_id"].nunique()),
         "n_skus": int(df["sku_id"].nunique()),
         "total_sales_units": int(df["sales_units"].sum()),
-        "last_updated": pd.Timestamp(
-            UPLOAD_PATH.stat().st_mtime, unit="s"
-        ).isoformat(),
     }
 
 
 @app.get("/upload/preview")
-async def upload_preview(
-    limit: int = 20, user: dict = Depends(get_current_user)
-):
+async def upload_preview(limit: int = 20, user: dict = Depends(get_current_user)):
     if not UPLOAD_PATH.exists():
         return {"rows": [], "message": "No uploads yet"}
 
@@ -515,7 +526,6 @@ async def upload_preview(
 async def clear_uploads(user: dict = Depends(require_role("admin"))):
     if UPLOAD_PATH.exists():
         UPLOAD_PATH.unlink()
-        logger.warning(f"User '{user['user']}' cleared all POS uploads")
     return {"status": "cleared", "by": user["user"]}
 
 
@@ -540,7 +550,24 @@ async def retrain_reset(user: dict = Depends(require_role("admin"))):
 
 
 # ============================================================
-# ENTRY POINT
+# GLOBAL ERROR HANDLER (helps debug Vercel 500s)
+# ============================================================
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request, exc):
+    logger.error(f"Unhandled exception on {request.url}: {exc}")
+    import traceback
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": type(exc).__name__,
+            "message": str(exc),
+            "traceback": traceback.format_exc().split("\n")[-5:],
+        },
+    )
+
+
+# ============================================================
+# ENTRY POINT (local dev only)
 # ============================================================
 if __name__ == "__main__":
     import uvicorn
