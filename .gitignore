@@ -8,3 +8,5 @@ logs/
 mlruns/
 .pytest_cache/
 *.egg-info/
+.vercel
+.env*
